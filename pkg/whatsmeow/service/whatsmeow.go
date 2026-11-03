@@ -301,6 +301,65 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// Container/pool único e capado para o store do whatsmeow.
+//
+// Antes, cada StartClient (conexão inicial E cada reconexão) chamava
+// sqlstore.New(), que abre um *sql.DB novo, sem limite de conexões e que nunca
+// era fechado. Cada chamada vazava um pool inteiro, saturando o Postgres até
+// "sorry, too many clients already".
+//
+// As variáveis são de pacote (e não campos do struct) porque os métodos de
+// whatsmeowService usam receiver por valor: uma atribuição a campo se perderia
+// na cópia do receiver.
+var (
+	sharedAuthContainer     *sqlstore.Container
+	sharedAuthContainerErr  error
+	sharedAuthContainerOnce sync.Once
+)
+
+func (w whatsmeowService) getAuthContainer() (*sqlstore.Container, error) {
+	sharedAuthContainerOnce.Do(func() {
+		var dbLog waLog.Logger
+		if w.config.WaDebug != "" {
+			dbLog = waLog.Stdout("Database", w.config.WaDebug, true)
+		}
+
+		var dialect, address string
+		if w.config.PostgresAuthDB != "" {
+			dialect, address = "postgres", w.config.PostgresAuthDB
+		} else {
+			dialect = "sqlite"
+			address = fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		}
+
+		db, err := sql.Open(dialect, address)
+		if err != nil {
+			sharedAuthContainerErr = fmt.Errorf("failed to open auth database: %w", err)
+			return
+		}
+
+		if dialect == "postgres" {
+			db.SetMaxOpenConns(20)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			db.SetConnMaxIdleTime(2 * time.Minute)
+		} else {
+			db.SetMaxOpenConns(1)
+		}
+
+		container := sqlstore.NewWithDB(db, dialect, dbLog)
+		if err := container.Upgrade(context.Background()); err != nil {
+			_ = db.Close()
+			sharedAuthContainerErr = fmt.Errorf("failed to upgrade auth database: %w", err)
+			return
+		}
+
+		sharedAuthContainer = container
+	})
+
+	return sharedAuthContainer, sharedAuthContainerErr
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -314,27 +373,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		}
 	}
 
-	var container *sqlstore.Container
-
-	if w.config.WaDebug != "" {
-		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
-	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
-	}
-
+	container, err := w.getAuthContainer()
 	if err != nil {
-		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to create container: %v", cd.Instance.Id, err)
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to get auth container: %v", cd.Instance.Id, err)
 		return
 	}
 
@@ -355,14 +396,24 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogWarn("[%s] No store found. Creating new one", cd.Instance.Id)
 		deviceStore = container.NewDevice()
 
+		// O JID salvo aponta para um device que não existe mais no store (logout
+		// removeu a linha). Sem limpar, todo start volta pelo caminho "Jid found",
+		// não acha o device e recai aqui — deixando a instância em limbo permanente.
+		if cd.Instance.Jid != "" {
+			if err := w.instanceRepository.UpdateJid(cd.Instance.Id, ""); err != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error clearing stale JID: %v", cd.Instance.Id, err)
+			} else {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Stale JID cleared", cd.Instance.Id)
+			}
+			cd.Instance.Jid = ""
+		}
+
 		cd.Instance.Connected = false
 		err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
 		if err != nil {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
 		}
 	}
-
-	var version clientVersion
 
 	platformID, ok := waCompanionReg.DeviceProps_PlatformType_value[strings.ToUpper("chrome")]
 	if ok {
@@ -375,33 +426,24 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	store.DeviceProps.Os = &cd.Instance.OsName
 	store.DeviceProps.RequireFullSync = proto.Bool(true)
 
-	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
-		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)
-		version.Major = w.config.WhatsappVersionMajor
-		if err == nil {
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-		}
-		version.Minor = w.config.WhatsappVersionMinor
-		if err == nil {
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-		}
-		version.Patch = w.config.WhatsappVersionPatch
-		if err == nil {
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
-		}
-	} else {
-		// Try to fetch version from WhatsApp Web
-		webVersion, err := fetchWhatsAppWebVersion()
+	configured := clientVersion{
+		Major: w.config.WhatsappVersionMajor,
+		Minor: w.config.WhatsappVersionMinor,
+		Patch: w.config.WhatsappVersionPatch,
+	}
+	var webVersion *clientVersion
+	if !configured.complete() {
+		fetched, err := fetchWhatsAppWebVersion()
 		if err != nil {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to fetch WhatsApp Web version: %v", cd.Instance.Id, err)
 		} else {
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from web to %d.%d.%d", cd.Instance.Id, webVersion.Major, webVersion.Minor, webVersion.Patch)
-			version = *webVersion
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
+			webVersion = fetched
 		}
 	}
+
+	version, source := resolveWAVersion(configured, webVersion)
+	applyWAVersion(version)
+	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from %s to %s", cd.Instance.Id, source, version.String())
 
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
 	// Usar "INFO" como nível mínimo para garantir que logs importantes apareçam
@@ -624,9 +666,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			// O sinal de kill significa parar. Reiniciar aqui criava um laço
+			// infinito: QR esgotado -> teardownQR -> kill -> StartClient -> QR
+			// esgotado... a cada ~2 min, para sempre, em qualquer instância
+			// deslogada. A reconexão agora é explícita, via /instance/connect.
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Client stopped — reconnect via /instance/connect", cd.Instance.Id)
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
@@ -2608,6 +2652,9 @@ var (
 	cachedWebVersionAt time.Time
 	cachedWebVersionMu sync.Mutex
 	webVersionCacheTTL = 1 * time.Hour
+	whatsAppWebSWURL   = "https://web.whatsapp.com/sw.js"
+	// Sem timeout, um WhatsApp Web lento travava o StartClient.
+	webVersionHTTPClient = &http.Client{Timeout: 10 * time.Second}
 )
 
 func fetchWhatsAppWebVersion() (*clientVersion, error) {
@@ -2618,7 +2665,7 @@ func fetchWhatsAppWebVersion() (*clientVersion, error) {
 		return cachedWebVersion, nil
 	}
 
-	resp, err := http.Get("https://web.whatsapp.com/sw.js")
+	resp, err := webVersionHTTPClient.Get(whatsAppWebSWURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch WhatsApp Web version: %v", err)
 	}
